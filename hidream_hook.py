@@ -229,6 +229,8 @@ def hidream_image_transformer_block_forward(
         taylor_cache_init(cache_dic, current)
         derivative_approximation(cache_dic, current, attn_output_t)
 
+        if attn_output_i.shape[1] != image_tokens.shape[1]:
+            return image_tokens, text_tokens
         image_tokens = gate_msa_i * attn_output_i + image_tokens
         text_tokens = gate_msa_t * attn_output_t + text_tokens
 
@@ -256,6 +258,8 @@ def hidream_image_transformer_block_forward(
             self.adaLN_modulation(adaln_input)[:,None].chunk(12, dim=-1)
         current['module'] = 'img_attn'
         attn_output_i = taylor_formula(cache_dic=cache_dic, current=current)
+        if attn_output_i.shape[1] != image_tokens.shape[1]:
+            return image_tokens, text_tokens
         image_tokens = gate_msa_i * attn_output_i + image_tokens
 
         current['module'] = 'txt_attn'
@@ -297,6 +301,8 @@ def hidream_image_single_transformer_block_forward(
         current["module"] = "img_attn"
         taylor_cache_init(cache_dic=cache_dic, current=current)
         derivative_approximation(cache_dic=cache_dic, current=current, feature=attn_output_i)
+        if attn_output_i.shape[1] != image_tokens.shape[1]:
+            return image_tokens
         image_tokens = gate_msa_i * attn_output_i + image_tokens
 
         # 2. Feed-forward
@@ -312,13 +318,15 @@ def hidream_image_single_transformer_block_forward(
                 self.adaLN_modulation(adaln_input)[:,None].chunk(6, dim=-1)
         current["module"] = "img_attn"
         attn_output_i = taylor_formula(cache_dic=cache_dic, current=current)
+        if attn_output_i.shape[1] != image_tokens.shape[1]:
+            return image_tokens
         image_tokens = gate_msa_i * attn_output_i + image_tokens
         current["module"] = "img_mlp"
         mlp_output = taylor_formula(cache_dic=cache_dic, current=current)
         image_tokens = gate_mlp_i * mlp_output + image_tokens
     return image_tokens
 
-def cache_init_hidream(fresh_threshold, max_order, first_enhance, last_enhance, steps):   
+def cache_init_hidream(fresh_threshold, max_order, first_enhance, last_enhance, steps, cache_to_cpu=False):   
     '''
     Initialization for cache.
     '''
@@ -347,6 +355,7 @@ def cache_init_hidream(fresh_threshold, max_order, first_enhance, last_enhance, 
     cache_dic['max_order'] = max_order
     cache_dic['first_enhance'] = first_enhance
     cache_dic['last_enhance'] = last_enhance
+    cache_dic['cache_to_cpu'] = cache_to_cpu
 
     current = {}
     current['activated_steps'] = [0]
@@ -372,6 +381,7 @@ def cal_type(cache_dic, current):
         cache_dic['cache_counter'] += 1
         current['type'] = 'taylor_cache'
 
+
 def derivative_approximation(cache_dic: Dict, current: Dict, feature: torch.Tensor):
     """
     Compute derivative approximation
@@ -379,16 +389,24 @@ def derivative_approximation(cache_dic: Dict, current: Dict, feature: torch.Tens
     :param current: Information of the current step
     """
     difference_distance = current['activated_steps'][-1] - current['activated_steps'][-2]
-
     updated_taylor_factors = {}
     updated_taylor_factors[0] = feature
 
     for i in range(cache_dic['max_order']):
-        if (cache_dic['cache'][-1][current['stream']][current['layer']][current['module']].get(i, None) is not None) and (current['step'] > cache_dic['first_enhance'] - 2):
-            updated_taylor_factors[i + 1] = (updated_taylor_factors[i] - cache_dic['cache'][-1][current['stream']][current['layer']][current['module']][i]) / difference_distance
+        old_cache_tensor = cache_dic['cache'][-1][current['stream']][current['layer']][current['module']].get(i, None)
+        if old_cache_tensor is not None and current['step'] > cache_dic['first_enhance'] - 2:
+            if updated_taylor_factors[i].shape != old_cache_tensor.shape:
+                break  # Skip Taylor update on shape mismatch
+            if cache_dic.get('cache_to_cpu', False):
+                old_cache_tensor = old_cache_tensor.to(updated_taylor_factors[i].device)
+            updated_taylor_factors[i + 1] = (updated_taylor_factors[i] - old_cache_tensor) / difference_distance
         else:
             break
-    
+
+    if cache_dic.get('cache_to_cpu', False):
+        for k in updated_taylor_factors:
+            updated_taylor_factors[k] = updated_taylor_factors[k].cpu()
+
     cache_dic['cache'][-1][current['stream']][current['layer']][current['module']] = updated_taylor_factors
 
 
@@ -397,7 +415,10 @@ def taylor_formula(cache_dic: Dict, current: Dict) -> torch.Tensor:
     output = 0
     
     for i in range(len(cache_dic['cache'][-1][current['stream']][current['layer']][current['module']])):
-        output += (1 / math.factorial(i)) * cache_dic['cache'][-1][current['stream']][current['layer']][current['module']][i] * (x ** i)
+        tensor = cache_dic['cache'][-1][current['stream']][current['layer']][current['module']][i]
+        if cache_dic.get('cache_to_cpu', False) and tensor.device.type != 'cuda':
+            tensor = tensor.to('cuda')
+        output += (1 / math.factorial(i)) * tensor * (x ** i)
     
     return output
 
